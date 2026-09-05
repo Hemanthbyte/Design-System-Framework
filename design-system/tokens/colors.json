@@ -1,0 +1,25 @@
+{
+  "_sync": {
+    "Primitives": {
+      "figmaCollection": "Primitives",
+      "activeMode": "Light",
+      "lastSynced": "1970-01-01T00:00:00.000Z",
+      "values": {
+        "neutral/0": "#FFFFFF",
+        "neutral/900": "#111111",
+        "accent/500": "#2F6FED"
+      }
+    },
+    "Tokens": {
+      "figmaCollection": "Tokens",
+      "activeMode": "Light",
+      "lastSynced": "1970-01-01T00:00:00.000Z",
+      "values": {
+        "background/page": "#FFFFFF",
+        "text/default": "#111111",
+        "action/primary": "#2F6FED"
+      }
+    }
+  },
+  "notes": "Example values. Replace by exporting variables from Figma and running npm run sync."
+}

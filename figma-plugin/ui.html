@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Inter, -apple-system, sans-serif; font-size: 13px; color: #111; background: #fff; padding: 20px; }
+  h2 { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  p { color: #555; line-height: 1.5; margin-bottom: 16px; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+
+  .tabs { display: flex; border-bottom: 1px solid #e5e7eb; margin-bottom: 16px; }
+  .tab { padding: 6px 14px; font-size: 13px; font-weight: 500; color: #6b7280; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tab.active { color: #111; border-bottom-color: #111; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  button {
+    width: 100%; padding: 9px 16px; background: #0066FF; color: #fff;
+    border: none; border-radius: 6px; font-size: 13px; font-weight: 500;
+    cursor: pointer; transition: background 0.15s;
+  }
+  button:hover { background: #0052CC; }
+  button:disabled { background: #9CA3AF; cursor: default; }
+
+  .file-row { display: flex; gap: 8px; margin-bottom: 12px; }
+  .file-row input[type=file] { display: none; }
+  .file-label {
+    flex: 1; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px;
+    font-size: 12px; color: #6b7280; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .choose-btn {
+    width: auto; padding: 8px 12px; font-size: 12px; background: #f3f4f6;
+    color: #374151; border: 1px solid #d1d5db; border-radius: 6px;
+  }
+  .choose-btn:hover { background: #e5e7eb; }
+
+  #status, #import-status { margin-top: 12px; font-size: 12px; color: #555; min-height: 18px; }
+  #status.error, #import-status.error { color: #DC2626; }
+  #status.success, #import-status.success { color: #059669; }
+</style>
+</head>
+<body>
+  <h2>Design System Token Sync</h2>
+
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('export')">Export</div>
+    <div class="tab" onclick="switchTab('import')">Import</div>
+  </div>
+
+  <!-- Export panel -->
+  <div id="panel-export" class="panel active">
+    <p>Downloads all local variables and text styles as <code>variables-export.json</code>. Place the file in <code>design-system/figma-cache/</code> then run <code>node scripts/sync-tokens.js</code>.</p>
+    <button id="btn-export" onclick="runExport()">Export Design Tokens</button>
+    <div id="status"></div>
+  </div>
+
+  <!-- Import panel -->
+  <div id="panel-import" class="panel">
+    <p>Push local token edits back into Figma. First run <code>node scripts/build-import.js</code> to generate the import file, then select it below.</p>
+    <div class="file-row">
+      <span class="file-label" id="file-label">No file selected</span>
+      <button class="choose-btn" onclick="document.getElementById('file-input').click()">Choose file</button>
+      <input type="file" id="file-input" accept=".json" onchange="onFileChosen(this)">
+    </div>
+    <button id="btn-import" onclick="runImport()" disabled>Import to Figma</button>
+    <div id="import-status"></div>
+  </div>
+
+<script>
+  var exportTimeout = null;
+  var importData    = null;
+
+  function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+    document.querySelectorAll('.panel').forEach(function(p) { p.classList.remove('active'); });
+    document.querySelector('.tab:nth-child(' + (name === 'export' ? 1 : 2) + ')').classList.add('active');
+    document.getElementById('panel-' + name).classList.add('active');
+  }
+
+  // ── Export ────────────────────────────────────────────────────────────────
+
+  function runExport() {
+    var btn = document.getElementById('btn-export');
+    var status = document.getElementById('status');
+    btn.disabled = true;
+    btn.textContent = 'Exporting\u2026';
+    status.textContent = '';
+    status.className = '';
+
+    exportTimeout = setTimeout(function() {
+      btn.disabled = false;
+      btn.textContent = 'Export Design Tokens';
+      status.textContent = 'Timed out \u2014 try again.';
+      status.className = 'error';
+    }, 30000);
+
+    parent.postMessage({ pluginMessage: { type: 'export' } }, '*');
+  }
+
+  // ── Import ────────────────────────────────────────────────────────────────
+
+  function onFileChosen(input) {
+    var file = input.files[0];
+    if (!file) return;
+    document.getElementById('file-label').textContent = file.name;
+    var reader = new FileReader();
+    reader.onload = function(e) {
+      try {
+        importData = JSON.parse(e.target.result);
+        document.getElementById('btn-import').disabled = false;
+        document.getElementById('import-status').textContent = 'File loaded \u2014 click Import to apply.';
+        document.getElementById('import-status').className = '';
+      } catch (_) {
+        importData = null;
+        document.getElementById('btn-import').disabled = true;
+        document.getElementById('import-status').textContent = 'Invalid JSON file.';
+        document.getElementById('import-status').className = 'error';
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function runImport() {
+    if (!importData) return;
+    var btn = document.getElementById('btn-import');
+    var status = document.getElementById('import-status');
+    btn.disabled = true;
+    btn.textContent = 'Importing\u2026';
+    status.textContent = '';
+    status.className = '';
+    parent.postMessage({ pluginMessage: { type: 'import', data: importData } }, '*');
+  }
+
+  // ── Message handler ───────────────────────────────────────────────────────
+
+  window.onmessage = function(event) {
+    var msg = event.data && event.data.pluginMessage;
+    if (!msg) return;
+
+    if (msg.type === 'download') {
+      clearTimeout(exportTimeout);
+      var json = JSON.stringify(msg.data, null, 2);
+      var blob = new Blob([json], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'variables-export.json';
+      a.click();
+      setTimeout(function() { URL.revokeObjectURL(url); }, 100);
+
+      var styles = msg.data.meta.styles || {};
+      var textCount   = (styles.text   || []).length;
+      var paintCount  = (styles.paint  || []).length;
+      var effectCount = (styles.effect || []).length;
+      var gridCount   = (styles.grid   || []).length;
+      var styleTotal  = textCount + paintCount + effectCount + gridCount;
+      var varCount    = Object.keys(msg.data.meta.variables).length;
+      var colCount    = Object.keys(msg.data.meta.variableCollections).length;
+
+      var btn = document.getElementById('btn-export');
+      btn.disabled = false;
+      btn.textContent = 'Export Design Tokens';
+      var status = document.getElementById('status');
+      status.textContent = '\u2713 Exported ' + varCount + ' variables across ' + colCount + ' collection' + (colCount !== 1 ? 's' : '') + ' and ' + styleTotal + ' styles (' + textCount + ' text, ' + paintCount + ' paint, ' + effectCount + ' effect, ' + gridCount + ' grid).';
+      status.className = 'success';
+    }
+
+    if (msg.type === 'import-result') {
+      var r = msg.results;
+      var btn = document.getElementById('btn-import');
+      btn.disabled = false;
+      btn.textContent = 'Import to Figma';
+      var status = document.getElementById('import-status');
+      var parts = [];
+      if (r.variables)    parts.push(r.variables    + ' variables');
+      if (r.textStyles)   parts.push(r.textStyles   + ' text styles');
+      if (r.paintStyles)  parts.push(r.paintStyles  + ' paint styles');
+      if (r.effectStyles) parts.push(r.effectStyles + ' effect styles');
+      if (r.gridStyles)   parts.push(r.gridStyles   + ' grid styles');
+      status.textContent = '\u2713 Imported: ' + (parts.join(', ') || 'nothing changed') + (r.errors && r.errors.length ? '. Errors: ' + r.errors.join('; ') : '');
+      status.className = (r.errors && r.errors.length) ? 'error' : 'success';
+    }
+
+    if (msg.type === 'error') {
+      clearTimeout(exportTimeout);
+      var errBtn = document.getElementById('btn-export');
+      errBtn.disabled = false;
+      errBtn.textContent = 'Export Design Tokens';
+      var errBtn2 = document.getElementById('btn-import');
+      errBtn2.disabled = false;
+      errBtn2.textContent = 'Import to Figma';
+      var errStatus = document.getElementById('status');
+      errStatus.textContent = 'Error: ' + msg.message;
+      errStatus.className = 'error';
+      var errStatus2 = document.getElementById('import-status');
+      errStatus2.textContent = 'Error: ' + msg.message;
+      errStatus2.className = 'error';
+    }
+  };
+</script>
+</body>
+</html>

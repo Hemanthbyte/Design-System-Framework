@@ -1,0 +1,27 @@
+/**
+ * Custom CSS for Design System Docs Site
+ * Overriding default Infima variables for a white-labeled appearance.
+ */
+
+:root {
+  --ifm-color-primary: #333333;
+  --ifm-color-primary-dark: #292929;
+  --ifm-color-primary-darker: #262626;
+  --ifm-color-primary-darkest: #202020;
+  --ifm-color-primary-light: #525252;
+  --ifm-color-primary-lighter: #606060;
+  --ifm-color-primary-lightest: #8c8c8c;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --ifm-font-family-base: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif;
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #e5e5e5;
+  --ifm-color-primary-dark: #cccccc;
+  --ifm-color-primary-darker: #bfbfbf;
+  --ifm-color-primary-darkest: #999999;
+  --ifm-color-primary-light: #f2f2f2;
+  --ifm-color-primary-lighter: #fdfdfd;
+  --ifm-color-primary-lightest: #ffffff;
+  --docusaurus-highlighted-code-line-bg: rgba(255, 255, 255, 0.1);
+}

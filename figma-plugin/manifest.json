@@ -1,0 +1,8 @@
+{
+  "name": "Design System Token Sync",
+  "id": "design-system-token-sync",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"]
+}

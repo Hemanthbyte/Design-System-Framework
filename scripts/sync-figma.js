@@ -1,0 +1,591 @@
+#!/usr/bin/env node
+
+/**
+ * Sync Figma Design to Local Cache
+ *
+ * Purpose: After design work in Figma, run this script to:
+ * - Query Figma REST API for changes
+ * - Update node-registry.md with new node IDs
+ * - Smart-merge markdown component specs (preserve user content, update frontmatter only)
+ * - Quarantine removed/conflicting components instead of deleting them
+ * - Log all changes in ai-log/
+ *
+ * Usage: node scripts/sync-figma.js
+ * Requires: FIGMA_ACCESS_TOKEN and FIGMA_FILE_KEY in .env
+ */
+
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const { PROJECT_ROOT, loadConfig, configuredPath } = require('./lib/config');
+
+// Load .env file if it exists
+const config = loadConfig();
+const ENV_FILE = path.join(PROJECT_ROOT, '.env');
+if (fs.existsSync(ENV_FILE)) {
+  const envContent = fs.readFileSync(ENV_FILE, 'utf8');
+  envContent.split('\n').forEach(line => {
+    const [key, ...rest] = line.split('=');
+    const value = rest.join('=');
+    if (key && value) {
+      process.env[key.trim()] = value.trim();
+    }
+  });
+}
+
+const CACHE_DIR = configuredPath(config, 'figmaCache');
+const STATE_FILE = path.join(CACHE_DIR, 'state.json');
+const REGISTRY_FILE = path.join(CACHE_DIR, 'node-registry.md');
+const DOCS_SOURCE_DIR = configuredPath(config, 'docsSource');
+const COMPONENTS_DIR = path.join(DOCS_SOURCE_DIR, 'components');
+const AI_LOG_DIR = path.join(DOCS_SOURCE_DIR, 'ai-log');
+const TOKENS_DIR = path.join(DOCS_SOURCE_DIR, 'tokens');
+
+[CACHE_DIR, COMPONENTS_DIR, AI_LOG_DIR, TOKENS_DIR].forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+const FIGMA_API = 'api.figma.com';
+const TOKEN = process.env.FIGMA_ACCESS_TOKEN;
+
+if (!TOKEN) {
+  console.error('❌ Error: FIGMA_ACCESS_TOKEN not found');
+  console.error('   Add it to .env file: FIGMA_ACCESS_TOKEN=<your-token>');
+  process.exit(1);
+}
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) {
+    return { lastSyncTime: null, fileKey: null, components: {} };
+  }
+  try {
+    return migrateState(JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')));
+  } catch (e) {
+    console.warn('⚠️  state.json is corrupted. Starting fresh (all components treated as new).');
+    return { lastSyncTime: null, fileKey: null, components: {} };
+  }
+}
+
+// Migrate old schema {name→id string} to new schema {id→{name,specFile}}
+function migrateState(state) {
+  const isOldFormat = Object.values(state.components || {}).some(v => typeof v === 'string');
+  if (!isOldFormat) return state;
+
+  console.log('📦 Migrating state.json to new format...');
+  const migrated = {};
+  for (const [name, nodeId] of Object.entries(state.components)) {
+    migrated[nodeId] = { name, specFile: normalizePath(`${name}.md`) };
+  }
+  return { ...state, components: migrated };
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// ─── Path utilities ───────────────────────────────────────────────────────────
+
+// Always use forward slashes in state.json (cross-platform safe)
+function normalizePath(p) {
+  return p.split(path.sep).join('/');
+}
+
+// Replace Windows-restricted characters in file names; preserve / for folder hierarchy
+function sanitizeFileName(name) {
+  return name.replace(/[*?"<>|]/g, '-').replace(/:/g, '-');
+}
+
+// Build the absolute spec file path from a sanitized component name
+function specFilePath(safeName) {
+  const parts = safeName.split('/');
+  return path.join(COMPONENTS_DIR, ...parts) + '.md';
+}
+
+// ─── Spec file operations ─────────────────────────────────────────────────────
+
+// Create a new skeleton spec with YAML frontmatter + section template
+function writeSkeletonSpec(filePath, comp, timestamp) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+
+  const isSet = comp.type === 'COMPONENT_SET';
+  const sections = isSet
+    ? [
+        '',
+        `# ${comp.name}`,
+        '',
+        '(Add component purpose and description)',
+        '',
+        '---',
+        '',
+        '## Variants',
+        '',
+        '<!-- sync:variants -->',
+        '(Variants will be populated on next sync)',
+        '<!-- /sync:variants -->',
+        '',
+        '## Sizes',
+        '',
+        '(Document size variants)',
+        '',
+        '## States',
+        '',
+        '(Document interactive states)',
+        '',
+        '## Anatomy & Token Map',
+        '',
+        '(Map every visual property to its semantic token)',
+        '',
+        '## Motion',
+        '',
+        '(Specify transitions — property, easing, duration)',
+        '',
+        '## Accessibility',
+        '',
+        '(Add WCAG notes, keyboard support, ARIA roles)',
+        '',
+        '## Component Properties',
+        '',
+        '(List Figma component properties with type, values, default)',
+        '',
+        '---',
+        '*Auto-generated by sync-figma.js. Edit sections below frontmatter freely.*',
+      ]
+    : [
+        '',
+        `# ${comp.name}`,
+        '',
+        '(Add component purpose and description)',
+        '',
+        '## Props',
+        '',
+        '(Document component properties)',
+        '',
+        '## Accessibility',
+        '',
+        '(Add WCAG notes, keyboard support, ARIA roles)',
+        '',
+        '---',
+        '*Auto-generated by sync-figma.js. Edit sections below frontmatter freely.*',
+      ];
+
+  const content = [
+    '---',
+    `nodeId: "${comp.id}"`,
+    `type: ${comp.type}`,
+    `figmaName: "${comp.name}"`,
+    `lastSynced: ${timestamp}`,
+    `status: active`,
+    '---',
+    ...sections,
+  ].join('\n');
+
+  fs.writeFileSync(filePath, content);
+}
+
+// Rewrite only the YAML frontmatter block; preserve all content after closing ---
+function updateSpecFrontmatter(filePath, comp, timestamp) {
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split('\n');
+
+  let endIdx = -1;
+  if (lines[0] === '---') {
+    endIdx = lines.indexOf('---', 1);
+  }
+
+  const newFrontmatter = [
+    '---',
+    `nodeId: "${comp.id}"`,
+    `type: ${comp.type}`,
+    `figmaName: "${comp.name}"`,
+    `lastSynced: ${timestamp}`,
+    `status: active`,
+    '---',
+  ].join('\n');
+
+  if (endIdx === -1) {
+    // No frontmatter found — prepend it, leave body untouched
+    fs.writeFileSync(filePath, newFrontmatter + '\n\n' + content);
+  } else {
+    const body = lines.slice(endIdx + 1).join('\n');
+    fs.writeFileSync(filePath, newFrontmatter + '\n' + body);
+  }
+}
+
+// ─── Quarantine ───────────────────────────────────────────────────────────────
+
+// Move file to _orphaned/YYYY-MM-DD/ with a notice header; never delete content
+function quarantine(filePath, nodeId, reason, timestamp) {
+  const ORPHAN_DIR = path.join(COMPONENTS_DIR, '_orphaned', timestamp);
+  fs.mkdirSync(ORPHAN_DIR, { recursive: true });
+
+  const baseName = path.basename(filePath, '.md');
+  const safeId = nodeId.replace(':', '-');
+  const destName = `${reason}_${baseName}_${safeId}.md`;
+  const destPath = path.join(ORPHAN_DIR, destName);
+
+  const notice = [
+    `> ⚠️ ORPHANED ${timestamp} — ${reason}`,
+    `> Original path: ${normalizePath(path.relative(COMPONENTS_DIR, filePath))}`,
+    `> Node ID was: ${nodeId}`,
+    `> Review and merge content manually, then delete this file.`,
+    '',
+    '',
+  ].join('\n');
+
+  const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+  fs.writeFileSync(destPath, notice + existing);
+
+  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  cleanEmptyDirs(path.dirname(filePath));
+  return destPath;
+}
+
+// Remove empty parent directories after a file is moved (never touches _orphaned or root)
+function cleanEmptyDirs(dir) {
+  if (!dir || dir === COMPONENTS_DIR || !fs.existsSync(dir)) return;
+  if (dir.includes('_orphaned')) return;
+  const files = fs.readdirSync(dir);
+  if (files.length === 0) {
+    fs.rmdirSync(dir);
+    cleanEmptyDirs(path.dirname(dir));
+  }
+}
+
+// ─── Component grouping & sync blocks ────────────────────────────────────────
+
+// Group extracted components into sets, their children, and standalone COMPONENTs
+function groupComponents(components) {
+  const sets = components.filter(c => c.type === 'COMPONENT_SET');
+  const childrenMap = new Map(); // setId → [comp, ...]
+  const standalone = [];
+  const setIds = new Set(sets.map(s => s.id));
+
+  components.forEach(c => {
+    if (c.type !== 'COMPONENT') return;
+    if (c.parentSetId && setIds.has(c.parentSetId)) {
+      if (!childrenMap.has(c.parentSetId)) childrenMap.set(c.parentSetId, []);
+      childrenMap.get(c.parentSetId).push(c);
+    } else {
+      standalone.push(c);
+    }
+  });
+
+  return { sets, childrenMap, standalone };
+}
+
+// Update the content inside a <!-- sync:X --> ... <!-- /sync:X --> block only
+function updateSyncBlock(filePath, blockName, content) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const open = `<!-- sync:${blockName} -->`;
+  const close = `<!-- /sync:${blockName} -->`;
+  const si = raw.indexOf(open);
+  const ei = raw.indexOf(close);
+  if (si === -1 || ei === -1) return; // block absent — skip silently
+  const before = raw.slice(0, si + open.length);
+  const after = raw.slice(ei);
+  fs.writeFileSync(filePath, `${before}\n${content}\n${after}`);
+}
+
+// Parse Figma component name into property key-value pairs.
+// Strips any leading "ParentName/" prefix — identified by having no "=" before the first "/".
+// This handles cases where Figma uses different casing or spacing vs the COMPONENT_SET name.
+function parseVariantProps(fullName) {
+  let str = fullName;
+  const slashIdx = fullName.indexOf('/');
+  if (slashIdx > -1 && !fullName.slice(0, slashIdx).includes('=')) {
+    str = fullName.slice(slashIdx + 1);
+  }
+  const props = {};
+  str.split(', ').forEach(part => {
+    const eq = part.indexOf('=');
+    if (eq > -1) props[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
+  });
+  return props;
+}
+
+// Build a markdown variants table with a Node ID column from child component list
+function buildVariantsTable(children) {
+  if (!children || children.length === 0) return '(No variants found)';
+  const allKeys = new Set();
+  const parsed = children.map(c => {
+    const props = parseVariantProps(c.name);
+    Object.keys(props).forEach(k => allKeys.add(k));
+    return { comp: c, props };
+  });
+  const keys = [...allKeys];
+  const header = `| ${keys.join(' | ')} | Node ID |`;
+  const sep = `| ${keys.map(() => '---').join(' | ')} | --- |`;
+  const rows = parsed.map(({ comp, props }) =>
+    `| ${keys.map(k => props[k] || '—').join(' | ')} | \`${comp.id}\` |`
+  );
+  return [header, sep, ...rows].join('\n');
+}
+
+// ─── Figma API ────────────────────────────────────────────────────────────────
+
+async function fetchFigma(endpoint) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: FIGMA_API,
+      path: `/v1${endpoint}`,
+      method: 'GET',
+      headers: { 'X-FIGMA-TOKEN': TOKEN }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 400) {
+          reject(new Error(`Figma API error (${res.statusCode}): ${data}`));
+        } else {
+          try { resolve(JSON.parse(data)); }
+          catch (e) { reject(e); }
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ─── Registry & log ───────────────────────────────────────────────────────────
+
+function updateRegistry(fileKey, entries) {
+  const header = `# Figma Node Registry
+fileKey: ${fileKey}
+lastSyncTime: ${new Date().toISOString()}
+
+| Component | Node ID | Last Updated | Status | Notes |
+|-----------|---------|--------------|--------|-------|
+`;
+  const rows = entries
+    .map(e => `| ${e.name} | ${e.nodeId} | ${e.updated} | ${e.status || 'active'} | ${e.notes || ''} |`)
+    .join('\n');
+  fs.writeFileSync(REGISTRY_FILE, header + rows);
+}
+
+function createLogEntry(fileKey, changes, reviewItems) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+  const logFile = path.join(AI_LOG_DIR, `${timestamp}.md`);
+
+  const content = `# Sync Report — ${new Date().toISOString()}
+
+**File Key:** ${fileKey}
+
+## Summary
+- **New:** ${changes.newEntries}
+- **Synced:** ${changes.synced}
+- **Renamed:** ${changes.renamed}
+- **Orphaned:** ${changes.removed}
+- **Conflicts:** ${changes.conflicts}
+
+## Review Items
+${reviewItems.length > 0 ? reviewItems.map(i => `- ${i}`).join('\n') : 'None'}
+
+## Files Updated
+${changes.filesUpdated.map(f => `- ${f}`).join('\n')}
+
+---
+Generated by sync-figma.js
+`;
+  fs.writeFileSync(logFile, content);
+  return logFile;
+}
+
+// ─── Main sync ────────────────────────────────────────────────────────────────
+
+async function sync() {
+  try {
+    console.log('🔄 Starting Figma sync...\n');
+
+    const state = loadState();
+    const fileKey = process.env.FIGMA_FILE_KEY || state.fileKey;
+
+    if (!fileKey || fileKey === '<ADD_YOUR_FIGMA_FILE_KEY_HERE>') {
+      console.error('⚠️  No Figma file key found. Add FIGMA_FILE_KEY to .env');
+      process.exit(1);
+    }
+
+    console.log(`📡 Fetching design from Figma (${fileKey})...`);
+    const fileData = await fetchFigma(`/files/${fileKey}`);
+
+    if (!fileData || !fileData.document) {
+      throw new Error('Invalid Figma response');
+    }
+
+    // Extract all COMPONENT and COMPONENT_SET nodes, preserving parent-child relationships
+    const extractNodes = (node, acc = [], parentSetId = null) => {
+      if (node.type === 'COMPONENT_SET') {
+        acc.push({ id: node.id, name: node.name, type: node.type });
+        if (node.children) node.children.forEach(child => extractNodes(child, acc, node.id));
+      } else if (node.type === 'COMPONENT') {
+        acc.push({ id: node.id, name: node.name, type: node.type, parentSetId });
+      } else {
+        if (node.children) node.children.forEach(child => extractNodes(child, acc, parentSetId));
+      }
+      return acc;
+    };
+
+    const components = extractNodes(fileData.document);
+    const { sets, childrenMap, standalone } = groupComponents(components);
+    const docComponents = [...sets, ...standalone]; // only these get spec files
+
+    // Safety gate: abort before touching anything if Figma returns zero components
+    if (components.length === 0) {
+      console.error('❌ Abort: Figma returned 0 components.');
+      console.error('   Check FIGMA_FILE_KEY and ensure the file has components.');
+      process.exit(1);
+    }
+
+    const timestamp = new Date().toISOString().split('T')[0];
+    const figmaDocIds = new Set(docComponents.map(c => c.id));
+    const childIds = new Set(components.filter(c => c.parentSetId).map(c => c.id));
+    const reviewItems = [];
+    const registryEntries = [];
+
+    const changes = {
+      newEntries: 0,
+      renamed: 0,
+      removed: 0,
+      conflicts: 0,
+      synced: 0,
+      filesUpdated: ['node-registry.md', 'state.json']
+    };
+
+    console.log('');
+
+    // Step A: Retire child COMPONENT entries from state (consolidated into parent sync blocks)
+    for (const [nodeId, cached] of Object.entries(state.components)) {
+      if (childIds.has(nodeId)) {
+        const specPath = path.join(COMPONENTS_DIR, ...cached.specFile.split('/'));
+        if (fs.existsSync(specPath)) {
+          quarantine(specPath, nodeId, 'consolidated-to-parent', timestamp);
+          changes.removed++;
+        }
+        delete state.components[nodeId];
+      }
+    }
+
+    // Step B: Quarantine COMPONENT_SET/standalone specs removed from Figma
+    for (const [nodeId, cached] of Object.entries(state.components)) {
+      if (!figmaDocIds.has(nodeId)) {
+        const specPath = path.join(COMPONENTS_DIR, ...cached.specFile.split('/'));
+        const dest = quarantine(specPath, nodeId, 'removed-from-figma', timestamp);
+        console.log(`  ⚠️  Orphaned: ${cached.name}`);
+        reviewItems.push(
+          `Orphaned (removed from Figma): ${cached.name}\n    → ${normalizePath(path.relative(PROJECT_ROOT, dest))}`
+        );
+        changes.removed++;
+        delete state.components[nodeId];
+      }
+    }
+
+    // Step C: Process COMPONENT_SET and standalone COMPONENT nodes only
+    for (const comp of docComponents) {
+      const safeName = sanitizeFileName(comp.name);
+      const specRelPath = normalizePath(`${safeName}.md`);
+      const specFile = specFilePath(safeName);
+      const cached = state.components[comp.id];
+
+      if (!cached) {
+        // New — create skeleton
+        writeSkeletonSpec(specFile, comp, timestamp);
+        console.log(`  ✨ New: ${comp.name}`);
+        changes.newEntries++;
+        changes.filesUpdated.push(`components/${specRelPath}`);
+
+      } else if (cached.name !== comp.name) {
+        // Renamed in Figma — move file if target is free, else quarantine
+        const oldFile = path.join(COMPONENTS_DIR, ...cached.specFile.split('/'));
+
+        if (fs.existsSync(specFile)) {
+          const dest = quarantine(oldFile, comp.id, 'CONFLICT', timestamp);
+          console.log(`  ⚠️  Rename conflict: ${cached.name} → ${comp.name} (target exists)`);
+          reviewItems.push(
+            `Rename conflict: "${cached.name}" → "${comp.name}" — target spec already exists\n    → Quarantined: ${normalizePath(path.relative(PROJECT_ROOT, dest))}`
+          );
+          changes.conflicts++;
+        } else {
+          fs.mkdirSync(path.dirname(specFile), { recursive: true });
+          if (fs.existsSync(oldFile)) {
+            fs.renameSync(oldFile, specFile);
+            cleanEmptyDirs(path.dirname(oldFile));
+          } else {
+            writeSkeletonSpec(specFile, comp, timestamp);
+          }
+          updateSpecFrontmatter(specFile, comp, timestamp);
+          console.log(`  🔀 Renamed: ${cached.name} → ${comp.name}`);
+          changes.renamed++;
+          changes.filesUpdated.push(`components/${specRelPath}`);
+        }
+
+      } else {
+        // Existing, same name — update frontmatter only, body never touched
+        if (!fs.existsSync(specFile)) {
+          writeSkeletonSpec(specFile, comp, timestamp);
+          console.log(`  🔧 Restored: ${comp.name}`);
+        } else {
+          updateSpecFrontmatter(specFile, comp, timestamp);
+          console.log(`  ✓  Synced: ${comp.name}`);
+        }
+        changes.synced++;
+      }
+
+      // For COMPONENT_SET nodes: populate the <!-- sync:variants --> block
+      if (comp.type === 'COMPONENT_SET' && fs.existsSync(specFile)) {
+        const setChildren = childrenMap.get(comp.id) || [];
+        if (setChildren.length > 0) {
+          updateSyncBlock(specFile, 'variants', buildVariantsTable(setChildren));
+        }
+      }
+
+      state.components[comp.id] = { name: comp.name, specFile: specRelPath };
+      registryEntries.push({
+        name: comp.name,
+        nodeId: comp.id,
+        updated: timestamp,
+        status: 'active',
+        notes: !cached ? 'New' : comp.type === 'COMPONENT_SET' ? 'Set' : ''
+      });
+    }
+
+    // Persist state and registry
+    state.lastSyncTime = new Date().toISOString();
+    state.fileKey = fileKey;
+    saveState(state);
+    updateRegistry(fileKey, registryEntries);
+
+    const logFile = createLogEntry(fileKey, changes, reviewItems);
+    changes.filesUpdated.push(normalizePath(path.relative(PROJECT_ROOT, logFile)));
+
+    // Summary
+    console.log('\n✅ Sync complete!\n');
+    console.log(
+      `   ${changes.synced} synced   ${changes.newEntries} new   ` +
+      `${changes.renamed} renamed   ${changes.removed} orphaned   ${changes.conflicts} conflicts`
+    );
+    console.log(`   Total tracked: ${Object.keys(state.components).length}`);
+
+    if (reviewItems.length > 0) {
+      console.log(`\n⚠️  REVIEW NEEDED (${reviewItems.length} item${reviewItems.length > 1 ? 's' : ''})`);
+      reviewItems.forEach(item => console.log(`  - ${item}`));
+      console.log(`\n  Orphaned files are in: components/_orphaned/${timestamp}/`);
+      console.log('  Delete that folder after salvaging any content you want to keep.\n');
+    }
+
+    console.log('\n📝 Updated files:');
+    changes.filesUpdated.forEach(f => console.log(`   - ${f}`));
+    console.log(`\n📋 Log: ${normalizePath(path.relative(PROJECT_ROOT, logFile))}`);
+    console.log('\n👉 Next: Review the log, then AI will read the updated registry.\n');
+
+  } catch (err) {
+    console.error('❌ Sync failed:', err.message);
+    process.exit(1);
+  }
+}
+
+sync();

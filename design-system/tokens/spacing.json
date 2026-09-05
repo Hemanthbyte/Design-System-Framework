@@ -1,0 +1,15 @@
+{
+  "_sync": {
+    "Spatial": {
+      "figmaCollection": "Spatial",
+      "activeMode": "Default",
+      "lastSynced": "1970-01-01T00:00:00.000Z",
+      "values": {
+        "space/s": 8,
+        "space/m": 16,
+        "space/l": 24,
+        "radius/s": 4
+      }
+    }
+  }
+}

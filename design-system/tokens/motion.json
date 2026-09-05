@@ -1,0 +1,14 @@
+{
+  "_sync": {
+    "Motion": {
+      "figmaCollection": "Motion",
+      "activeMode": "Default",
+      "lastSynced": "1970-01-01T00:00:00.000Z",
+      "values": {
+        "duration/fast": 160,
+        "duration/base": 240,
+        "easing/standard": "cubic-bezier(0.2, 0, 0, 1)"
+      }
+    }
+  }
+}

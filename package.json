@@ -1,0 +1,18 @@
+{
+  "name": "design-system-framework",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "setup": "npm install && npm run docs:install",
+    "sync": "node scripts/sync-tokens.js",
+    "sync:push": "node scripts/sync-tokens.js --push",
+    "generate": "node scripts/generate-tokens.js",
+    "promote": "node scripts/promote-docs.js",
+    "sync:components": "node scripts/sync-figma.js",
+    "docs:install": "cd docs/site && npm install",
+    "docs:start": "cd docs/site && npm run start",
+    "docs:build": "cd docs/site && npm run build",
+    "docs:serve": "cd docs/site && npm run serve"
+  }
+}
