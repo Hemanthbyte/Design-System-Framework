@@ -20,7 +20,9 @@ Design System engineers, solo developers, and agile teams who want enterprise-gr
 ## Metrics & Savings (How is this useful?)
 
 - **Cost Effectiveness:** Provides REST API-like programmatic token synchronization—a feature typically restricted to the Figma Organization plan ($45/editor/month)—by using the free Figma Plugin API.
+  
 - **Time Savings:** Replaces an estimated **10+ hours per month** of manual designer-to-developer token handoff, transcription, PRs, and CSS updates with a single 2-second `npm run sync` command.
+  
 - **AI Token Efficiency (MCP Optimization):** Directly querying the Figma API via an AI MCP tool returns deeply nested payloads that can easily exceed **150,000+ context tokens** for a full design system (costing ~$3+ in API fees per read and frequently maxing out context windows). By extracting and flattening Figma Node IDs and metadata into our local JSON registry, the context load is reduced to roughly **~2,000 tokens** per agentic read. This **~98% reduction in context window consumption** prevents API throttling, slashes latency, and allows autonomous AI agents to parse the entire design system instantly and cheaply.
 
 ---
